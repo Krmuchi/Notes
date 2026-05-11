@@ -1,0 +1,1571 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState, lazy, Suspense } from "react";
+import type { NoteDoc, Notebook } from "./types";
+import { useNotesStore } from "./store/notesStore";
+import {
+  insertWrappedText as utilsInsertWrappedText,
+  insertLinePrefix as utilsInsertLinePrefix,
+  insertHeading as utilsInsertHeading,
+  insertLink as utilsInsertLink,
+  insertImage as utilsInsertImage,
+  insertCodeBlock as utilsInsertCodeBlock
+} from "./utils/editorUtils";
+import { saveDraft, loadLatestDraft, clearDrafts } from "./utils/autoSaveUtils";
+import { ToastContainer, useToast } from "./components/Toast";
+import { Loading } from "./components/Loading";
+import "./App.css";
+
+const StartPage = lazy(() => import("./components/StartPage"));
+const SharePanel = lazy(() => import("./components/SharePanel"));
+const TagPanel = lazy(() => import("./components/TagPanel"));
+const DocTagSelector = lazy(() => import("./components/DocTagSelector"));
+const SearchPanel = lazy(() => import("./components/SearchPanel"));
+const VersionHistoryPanel = lazy(() => import("./components/VersionHistoryPanel"));
+
+type LazyLoaderProps = {
+  children: React.ReactNode;
+};
+
+function LazyLoader({ children }: LazyLoaderProps) {
+  return (
+    <Suspense fallback={
+      <div style={{ padding: '20px', textAlign: 'center', color: '#999', display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
+        <Loading type="spinner" size="medium" text="加载中..." />
+      </div>
+    }>
+      {children}
+    </Suspense>
+  );
+}
+
+interface RecentView {
+  docId: string;
+  notebookId: string;
+  viewedAt: string;
+}
+
+function App() {
+  const {
+    notebooks, 
+    activeNotebookId, 
+    activeDocId, 
+    searchText,
+    trash,
+    tags,
+    loadNotes,
+    saveNotes,
+    setActiveNotebookId,
+    setActiveDocId,
+    setSearchText,
+    createNotebook,
+    deleteNotebook,
+    createDoc,
+    updateDoc,
+    moveDocToTrash,
+    toggleFavorite,
+    restoreFromTrash,
+    deleteFromTrash,
+    clearTrash,
+    generateShareLink,
+    deleteShareLink,
+    saveStatus,
+    setSaveStatus,
+  } = useNotesStore();
+
+  const [showMoreMenu, setShowMoreMenu] = useState(false);
+  const [fontSize, setFontSize] = useState<string>("15px");
+  const [textStyle, setTextStyle] = useState<string>("正文");
+  const [showMoreOptions, setShowMoreOptions] = useState(false);
+  const [activeView, setActiveView] = useState<string>("notebooks");
+  const [activeLeftMenu, setActiveLeftMenu] = useState<string>("notebooks");
+  const [recentViews, setRecentViews] = useState<RecentView[]>([]);
+  const [notebooksExpanded, setNotebooksExpanded] = useState(true);
+  const [showSharePanel, setShowSharePanel] = useState(false);
+  const [showTagPanel, setShowTagPanel] = useState(false);
+  const [showSearchPanel, setShowSearchPanel] = useState(false);
+  const [showVersionHistory, setShowVersionHistory] = useState(false);
+  const [, setTagsUpdated] = useState(0);
+  const [showRecoveryDialog, setShowRecoveryDialog] = useState(false);
+  const [recoveryDraftMeta, setRecoveryDraftMeta] = useState<{ timestamp: string; docTitle: string } | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const dirtyRef = useRef(false);
+  const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const { toasts, removeToast, error } = useToast();
+
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+    docId: string;
+  } | null>(null);
+
+  const [notebookContextMenu, setNotebookContextMenu] = useState<{
+    x: number;
+    y: number;
+    notebookId: string;
+  } | null>(null);
+
+  useEffect(() => {
+    const handleClickOutside = () => {
+      setContextMenu(null);
+      setNotebookContextMenu(null);
+    };
+    document.addEventListener('click', handleClickOutside);
+    return () => document.removeEventListener('click', handleClickOutside);
+  }, []);
+
+  const handleViewDoc = (notebookId: string, docId: string) => {
+    setRecentViews(prev => {
+      const filtered = prev.filter(v => !(v.docId === docId && v.notebookId === notebookId));
+      return [{ docId, notebookId, viewedAt: new Date().toISOString() }, ...filtered].slice(0, 50);
+    });
+    setActiveNotebookId(notebookId);
+    setActiveDocId(docId);
+    setActiveView("notebooks");
+    setActiveLeftMenu("notebooks");
+  };
+
+  const handleRename = (docId: string) => {
+    const notebook = notebooks.find(nb => nb.docs.some(d => d.id === docId));
+    if (!notebook) return;
+    
+    const doc = notebook.docs.find(d => d.id === docId);
+    if (!doc) return;
+    
+    const newTitle = window.prompt('请输入新名称', doc.title);
+    if (newTitle !== null && newTitle.trim() !== '') {
+      updateDoc(notebook.id, docId, { title: newTitle.trim() });
+    }
+    setContextMenu(null);
+  };
+
+  const handleCopyLink = (docId: string) => {
+    navigator.clipboard.writeText(`${window.location.origin}/doc/${docId}`);
+    setContextMenu(null);
+  };
+
+  const handleCopy = (docId: string) => {
+    const notebook = notebooks.find(nb => nb.docs.some(d => d.id === docId));
+    if (!notebook) return;
+    
+    const doc = notebook.docs.find(d => d.id === docId);
+    if (!doc) return;
+    
+    createDoc(notebook.id, doc.parentId, {
+      title: `${doc.title || '未命名文档'} (副本)`,
+      content: doc.content,
+      tags: doc.tags,
+    });
+    setContextMenu(null);
+  };
+
+  const handleDelete = (docId: string) => {
+    const notebook = notebooks.find(nb => nb.docs.some(d => d.id === docId));
+    if (!notebook) return;
+    
+    if (window.confirm('确定要删除此文档吗？删除后可在回收站恢复吗？')) {
+      moveDocToTrash(notebook.id, docId);
+      if (activeDocId === docId) {
+        setActiveDocId('');
+      }
+    }
+    setContextMenu(null);
+  };
+
+  const handleOpenInNewWindow = (docId: string) => {
+    window.open(`/doc/${docId}`, '_blank');
+    setContextMenu(null);
+  };
+
+  const [showPresentationMenu, setShowPresentationMenu] = useState(false);
+
+  const handleStartPresentation = () => {
+    alert('演示功能已触发\n\n即将进入全屏演示模式');
+    setShowPresentationMenu(false);
+  };
+
+  const handleEditPresentation = () => {
+    alert('演示分页编辑功能已触发\n\n您可以编辑演示的分页结构');
+    setShowPresentationMenu(false);
+  };
+
+  const handleRemoveFromDirectory = (docId: string) => {
+    const notebook = notebooks.find(nb => nb.docs.some(d => d.id === docId));
+    if (!notebook) return;
+    
+    updateDoc(notebook.id, docId, { parentId: null });
+    setContextMenu(null);
+  };
+
+  const handleMove = (docId: string) => {
+    const notebook = notebooks.find(nb => nb.docs.some(d => d.id === docId));
+    if (!notebook) return;
+    
+    const doc = notebook.docs.find(d => d.id === docId);
+    if (!doc) return;
+    
+    const otherDocs = notebook.docs.filter(d => d.id !== docId);
+    if (otherDocs.length === 0) {
+      alert('没有其他文档可以移动');
+      setContextMenu(null);
+      return;
+    }
+    
+    const options = otherDocs.map(d => ({
+      value: d.id,
+      label: `${' '.repeat((docDepthMap.get(d.id) ?? 0) * 2)}${d.title || '未命名文档'}`
+    }));
+    
+    const selectHtml = `
+      <select id="moveTarget">
+        <option value="">移动到根目录</option>
+        ${options.map(o => `<option value="${o.value}">${o.label}</option>`).join('')}
+      </select>
+    `;
+    
+    const container = document.createElement('div');
+    container.innerHTML = selectHtml;
+    const select = container.querySelector('#moveTarget') as HTMLSelectElement;
+    
+    if (confirm(`选择目标位置后确定移动？`)) {
+      const targetId = select.value || null;
+      updateDoc(notebook.id, docId, { parentId: targetId });
+    }
+    setContextMenu(null);
+  };
+
+  const handleExport = (docId: string) => {
+    const notebook = notebooks.find(nb => nb.docs.some(d => d.id === docId));
+    if (!notebook) return;
+    
+    const doc = notebook.docs.find(d => d.id === docId);
+    if (!doc) return;
+    
+    const content = `# ${doc.title || '未命名文档'}\n\n${doc.content || ''}`;
+    const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `${doc.title || '未命名文档'}.md`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    setContextMenu(null);
+  };
+
+  const handlePin = (docId: string) => {
+    const notebook = notebooks.find(nb => nb.docs.some(d => d.id === docId));
+    if (!notebook) return;
+    
+    const doc = notebook.docs.find(d => d.id === docId);
+    if (!doc) return;
+    
+    updateDoc(notebook.id, docId, { pinned: !doc.pinned });
+    setContextMenu(null);
+  };
+
+  const handleRemoveNotebookFromFavorites = (_notebookId: string) => {
+    setNotebookContextMenu(null);
+    alert('移出常用功能已触发');
+  };
+
+  const handleSetNotebookOfflineAvailable = (_notebookId: string) => {
+    setNotebookContextMenu(null);
+    alert('设为离线可用功能已触发');
+  };
+
+  const handleNotebookPermissions = (_notebookId: string) => {
+    setNotebookContextMenu(null);
+    alert('权限设置功能已触发');
+  };
+
+  const handleNotebookMoreSettings = (_notebookId: string) => {
+    setNotebookContextMenu(null);
+    alert('更多设置功能已触发');
+  };
+
+  const handleDeleteNotebook = (notebookId: string) => {
+    const notebook = notebooks.find(nb => nb.id === notebookId);
+    if (!notebook) return;
+    
+    if (window.confirm(`确定要删除知识库「${notebook.title}」吗？知识库中的所有文档将被移到回收站。`)) {
+      deleteNotebook(notebookId);
+      setNotebookContextMenu(null);
+    } else {
+      setNotebookContextMenu(null);
+    }
+  };
+
+  const favoriteDocs = useMemo(() => {
+    const favorites: { notebook: Notebook; doc: NoteDoc }[] = [];
+    notebooks.forEach(notebook => {
+      notebook.docs.forEach(doc => {
+        if (doc.favorite) {
+          favorites.push({ notebook, doc });
+        }
+      });
+    });
+    return favorites.sort((a, b) => new Date(b.doc.updatedAt).getTime() - new Date(a.doc.updatedAt).getTime());
+  }, [notebooks]);
+
+  useEffect(() => {
+    const draft = loadLatestDraft();
+
+    loadNotes().then(() => {
+      setIsLoading(false);
+      // After loading from disk, check if there's a newer local draft (crash recovery)
+      if (draft) {
+        const current = useNotesStore.getState();
+        const draftNotebooks = JSON.stringify(draft.data.notebooks);
+        const currentNotebooks = JSON.stringify(current.notebooks);
+        const draftTrash = JSON.stringify(draft.data.trash);
+        const currentTrash = JSON.stringify(current.trash);
+
+        if (draftNotebooks !== currentNotebooks || draftTrash !== currentTrash) {
+          setRecoveryDraftMeta({
+            timestamp: draft.meta.timestamp,
+            docTitle: draft.meta.docTitle,
+          });
+          setShowRecoveryDialog(true);
+        }
+      }
+    }).catch(error => {
+      console.error('Failed to load notes:', error);
+      setIsLoading(false);
+      error('加载笔记失败，请检查数据文件');
+    });
+  }, [error]);
+
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      saveNotes();
+      clearDrafts();
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+    };
+  }, []);
+
+  // Auto-save: debounced save to disk + localStorage on data change
+  useEffect(() => {
+    // Skip the initial mount trigger
+    if (!dirtyRef.current) {
+      dirtyRef.current = true;
+      return;
+    }
+
+    if (autoSaveTimerRef.current) {
+      clearTimeout(autoSaveTimerRef.current);
+    }
+
+    autoSaveTimerRef.current = setTimeout(() => {
+      const state = useNotesStore.getState();
+      const activeDocTitle = activeDoc?.title;
+      saveDraft(
+        { notebooks: state.notebooks, trash: state.trash, tags: state.tags, searchHistory: state.searchHistory },
+        activeDocTitle,
+      );
+      saveNotes();
+    }, 2000);
+
+    return () => {
+      if (autoSaveTimerRef.current) {
+        clearTimeout(autoSaveTimerRef.current);
+      }
+    };
+  }, [notebooks, trash, tags]);
+
+  const handleRecoverDraft = useCallback(() => {
+    const draft = loadLatestDraft();
+    if (!draft) return;
+
+    const state = useNotesStore.getState();
+    state.updateStore(draft.data);
+
+    // Re-select active doc if possible
+    if (draft.data.notebooks.length > 0) {
+      const nb = draft.data.notebooks[0];
+      state.setActiveNotebookId(nb.id);
+      if (nb.docs.length > 0) {
+        state.setActiveDocId(nb.docs[0].id);
+      }
+    }
+
+    setSaveStatus('saved');
+    setShowRecoveryDialog(false);
+    clearDrafts();
+  }, [setSaveStatus]);
+
+  const handleDiscardDraft = useCallback(() => {
+    clearDrafts();
+    setShowRecoveryDialog(false);
+  }, []);
+
+  const activeNotebook = useMemo(
+    () => notebooks.find((item) => item.id === activeNotebookId) ?? null,
+    [activeNotebookId, notebooks],
+  );
+  const activeDoc = useMemo(
+    () => activeNotebook?.docs.find((item) => item.id === activeDocId) ?? null,
+    [activeDocId, activeNotebook],
+  );
+
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const searchResultDocs = useMemo(() => {
+    if (!activeNotebook || !searchText.trim()) return activeNotebook?.docs || [];
+    const keyword = searchText.trim().toLowerCase();
+    return activeNotebook.docs.filter((doc) => {
+      const haystack = `${doc.title} ${doc.content} ${doc.tags.join(" ")}`.toLowerCase();
+      return haystack.includes(keyword);
+    });
+  }, [activeNotebook, searchText]);
+
+  const docDepthMap = useMemo(() => {
+    if (!activeNotebook) return new Map<string, number>();
+    const map = new Map<string, number>();
+    const lookup = new Map(activeNotebook.docs.map((doc) => [doc.id, doc]));
+    const depthFor = (doc: NoteDoc, seen = new Set<string>()): number => {
+      if (!doc.parentId || !lookup.get(doc.parentId) || seen.has(doc.parentId)) return 0;
+      const parent = lookup.get(doc.parentId);
+      if (!parent) return 0;
+      seen.add(doc.parentId);
+      return 1 + depthFor(parent, seen);
+    };
+    activeNotebook.docs.forEach((doc) => {
+      map.set(doc.id, depthFor(doc));
+    });
+    return map;
+  }, [activeNotebook]);
+
+  type DocSnapshot = { title: string; content: string; tags: string[]; time?: number };
+  const [pastSnapshots, setPastSnapshots] = useState<DocSnapshot[]>([]);
+  const [futureSnapshots, setFutureSnapshots] = useState<DocSnapshot[]>([]);
+  const historyLimit = 200;
+  const lastHistoryAtRef = useRef<number>(0);
+  const mergeWindow = 1000;
+
+  const canUndo = pastSnapshots.length > 0;
+  const canRedo = futureSnapshots.length > 0;
+
+  const undo = () => {
+    if (!activeDoc || !canUndo) return;
+    const prev = pastSnapshots[pastSnapshots.length - 1];
+    setPastSnapshots((p) => p.slice(0, p.length - 1));
+    setFutureSnapshots((f) => [...f, { title: activeDoc.title ?? "", content: activeDoc.content ?? "", tags: activeDoc.tags ?? [] }]);
+    updateDoc(activeNotebookId, activeDoc.id, { title: prev.title, content: prev.content, tags: prev.tags });
+  };
+
+  const redo = () => {
+    if (!activeDoc || !canRedo) return;
+    const next = futureSnapshots[futureSnapshots.length - 1];
+    setFutureSnapshots((f) => f.slice(0, f.length - 1));
+    setPastSnapshots((p) => [...p, { title: activeDoc.title ?? "", content: activeDoc.content ?? "", tags: activeDoc.tags ?? [] }]);
+    updateDoc(activeNotebookId, activeDoc.id, { title: next.title, content: next.content, tags: next.tags });
+  };
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const meta = e.ctrlKey || e.metaKey;
+      const target = e.target as HTMLElement;
+      const isInput = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA';
+      
+      if (meta && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setShowSearchPanel(true);
+        return;
+      }
+      
+      if (!meta) return;
+      if (isInput) return;
+      
+      const key = e.key.toLowerCase();
+      if (key === 'z') {
+        e.preventDefault();
+        undo();
+      } else if (key === 'y' || (e.shiftKey && key === 'z')) {
+        e.preventDefault();
+        redo();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [canUndo, canRedo]);
+
+  const handlePaste = (ev: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = ev.clipboardData && ev.clipboardData.items;
+    if (!items) return;
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.type && item.type.indexOf("image") === 0) {
+        const file = item.getAsFile();
+        if (file) {
+          ev.preventDefault();
+          void insertImageFunc(file);
+          return;
+        }
+      }
+    }
+  };
+
+  const insertWrap = (prefix: string, suffix?: string) => {
+    const ta = textareaRef.current;
+    if (!ta || !activeDoc) return;
+    utilsInsertWrappedText(ta, prefix, suffix);
+    updateDocContent({ content: ta.value });
+  };
+
+  const insertHeadingFunc = (level: number) => {
+    const ta = textareaRef.current;
+    if (!ta || !activeDoc) return;
+    utilsInsertHeading(ta, level);
+    updateDocContent({ content: ta.value });
+    setTimeout(() => ta.focus(), 0);
+  };
+
+  const insertLinkFunc = () => {
+    const ta = textareaRef.current;
+    if (!ta || !activeDoc) return;
+    utilsInsertLink(ta);
+    updateDocContent({ content: ta.value });
+  };
+
+  const insertImageFunc = async (file: File) => {
+    if (!file || !activeDoc) return;
+    const reader = new FileReader();
+    reader.onload = async () => {
+      const data = (reader.result as string) || "";
+      try {
+        const saved = await window.notesApi.saveImage({ name: file.name, data });
+        const src = saved || data;
+        const ta = textareaRef.current;
+        if (ta) {
+          utilsInsertImage(ta, src);
+          updateDocContent({ content: ta.value });
+        }
+      } catch (err) {
+        const ta = textareaRef.current;
+        if (ta) {
+          utilsInsertImage(ta, data);
+          updateDocContent({ content: ta.value });
+        }
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const insertCodeBlockFunc = () => {
+    const ta = textareaRef.current;
+    if (!ta || !activeDoc) return;
+    utilsInsertCodeBlock(ta);
+    updateDocContent({ content: ta.value });
+  };
+
+  const insertQuote = () => {
+    const ta = textareaRef.current;
+    if (ta) {
+      utilsInsertLinePrefix(ta, "> ");
+      updateDocContent({ content: ta.value });
+    }
+  };
+
+  const insertUnderline = () => {
+    const ta = textareaRef.current;
+    if (ta) {
+      utilsInsertWrappedText(ta, "<u>", "</u>");
+      updateDocContent({ content: ta.value });
+    }
+  };
+
+  const insertUnorderedList = () => {
+    const ta = textareaRef.current;
+    if (ta) {
+      utilsInsertLinePrefix(ta, "- ");
+      updateDocContent({ content: ta.value });
+    }
+  };
+
+  const insertOrderedList = () => {
+    const ta = textareaRef.current;
+    if (ta) {
+      utilsInsertLinePrefix(ta, "1. ");
+      updateDocContent({ content: ta.value });
+    }
+  };
+
+  const updateDocContent = (changes: Partial<NoteDoc>) => {
+    if (!activeNotebook || !activeDoc) return;
+    if (typeof changes.content !== 'undefined' || typeof changes.title !== 'undefined' || typeof changes.tags !== 'undefined') {
+      const now = Date.now();
+      const last = lastHistoryAtRef.current;
+      const prevSnapshot: DocSnapshot = {
+        title: activeDoc.title ?? "",
+        content: activeDoc.content ?? "",
+        tags: activeDoc.tags ?? [],
+        time: now,
+      };
+      if (now - last > mergeWindow) {
+        setPastSnapshots((p) => {
+          const next = [...p, prevSnapshot];
+          if (next.length > historyLimit) return next.slice(next.length - historyLimit);
+          return next;
+        });
+        setFutureSnapshots([]);
+        lastHistoryAtRef.current = now;
+      } else {
+        lastHistoryAtRef.current = now;
+      }
+    }
+    updateDoc(activeNotebook.id, activeDoc.id, changes);
+  };
+
+  const handleGenerateShareLink = (permission: string, password: string, expiresAt: string | null) => {
+    if (!activeNotebookId || !activeDocId) return;
+    generateShareLink(activeNotebookId, activeDocId, permission as 'view' | 'comment' | 'edit' | 'manage', password, expiresAt);
+  };
+
+  const handleDeleteShareLink = (linkId: string) => {
+    if (!activeNotebookId || !activeDocId) return;
+    deleteShareLink(activeNotebookId, activeDocId, linkId);
+  };
+
+  const handleCopyShareUrl = (url: string) => {
+    navigator.clipboard.writeText(url);
+  };
+
+  return (
+    <>
+      {isLoading ? (
+        <div className="app-loading">
+          <Loading type="spinner" size="large" text="正在加载笔记..." />
+        </div>
+      ) : (
+        <div className="app-shell">
+          <aside className="main-sidebar">
+        <div className="sidebar-header">
+          <div className="brand">
+            <span className="brand-icon">📝</span>
+            <span className="brand-text">笔记</span>
+          </div>
+          <div className="sidebar-search-wrapper">
+            <div className="sidebar-search">
+              <span className="search-icon">🔍</span>
+              <input
+                className="search-input"
+                placeholder="搜索"
+                value={searchText}
+                onChange={(event) => setSearchText(event.target.value)}
+                onClick={() => setShowSearchPanel(true)}
+              />
+              <span className="search-shortcut">Ctrl+K</span>
+            </div>
+            <button 
+              className="search-add-btn"
+              onClick={() => activeNotebook && createDoc(activeNotebook.id, null)}
+              title="新建文档"
+            >
+              +
+            </button>
+          </div>
+        </div>
+        
+        <nav className="sidebar-nav">
+          <button
+            className={`nav-item ${activeLeftMenu === "start" ? "active" : ""}`}
+            onClick={() => setActiveLeftMenu("start")}
+          >
+            <span className="nav-icon">🏠</span>
+            <span className="nav-text">开始</span>
+          </button>
+          <button
+            className={`nav-item ${activeLeftMenu === "note" ? "active" : ""}`}
+            onClick={() => setActiveLeftMenu("note")}
+          >
+            <span className="nav-icon">📝</span>
+            <span className="nav-text">小记</span>
+          </button>
+          <button
+            className={`nav-item ${activeLeftMenu === "favorite" ? "active" : ""}`}
+            onClick={() => {
+              setActiveLeftMenu("favorite");
+              setActiveView("favorite");
+            }}
+          >
+            <span className="nav-icon">⭐</span>
+            <span className="nav-text">收藏</span>
+          </button>
+          <button
+            className={`nav-item ${activeLeftMenu === "tags" ? "active" : ""}`}
+            onClick={() => {
+              setActiveLeftMenu("tags");
+              setShowTagPanel(true);
+            }}
+          >
+            <span className="nav-icon">🏷️</span>
+            <span className="nav-text">标签</span>
+            {tags.length > 0 && (
+              <span className="nav-badge">{tags.length}</span>
+            )}
+          </button>
+        </nav>
+        
+        <div className="sidebar-section">
+          <button
+            className="section-header"
+            onClick={() => setNotebooksExpanded(!notebooksExpanded)}
+          >
+            <span className="section-expand-icon">{notebooksExpanded ? "▼" : "▶"}</span>
+            <span className="section-title">知识库</span>
+            <button
+              className="btn-add-notebook"
+              onClick={(e) => {
+                e.stopPropagation();
+                createNotebook("新建知识库");
+              }}
+              title="新建知识库"
+            >
+              +
+            </button>
+          </button>
+          {notebooksExpanded && (
+            <div className="notebooks-list">
+              {notebooks.map((notebook) => (
+                <button
+                  key={notebook.id}
+                  className={`notebook-item ${activeNotebookId === notebook.id ? "active" : ""}`}
+                  onClick={() => {
+                    setActiveLeftMenu("notebooks");
+                    setActiveView("notebooks");
+                    setActiveNotebookId(notebook.id);
+                    setActiveDocId(notebook.docs[0]?.id ?? "");
+                  }}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    setNotebookContextMenu({ x: e.clientX, y: e.clientY, notebookId: notebook.id });
+                  }}
+                >
+                  <span className="notebook-icon">📁</span>
+                  <span className="notebook-name">{notebook.title}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+        
+        <div className="sidebar-footer">
+          <div className="more-menu-container">
+            <button 
+              className="footer-item"
+              onClick={() => setShowMoreMenu(!showMoreMenu)}
+            >
+              <span className="footer-icon">⋯</span>
+              <span className="footer-text">更多</span>
+            </button>
+            {showMoreMenu && (
+              <div className="more-menu">
+                <div className="more-menu-section">
+                  <button 
+                    className={`more-menu-item ${activeView === "trash" ? "active" : ""}`}
+                    onClick={() => {
+                      setActiveView("trash");
+                      setShowMoreMenu(false);
+                    }}
+                  >
+                    <span className="more-menu-icon">🗑️</span>
+                    <span className="more-menu-text">回收站</span>
+                    {trash.length > 0 && (
+                      <span className="more-menu-badge">{trash.length}</span>
+                    )}
+                  </button>
+                </div>
+                <div className="more-menu-section">
+                  <button className="more-menu-item">
+                    <span className="more-menu-icon">📤</span>
+                    <span className="more-menu-text">导入文档</span>
+                  </button>
+                  <button className="more-menu-item">
+                    <span className="more-menu-icon">📥</span>
+                    <span className="more-menu-text">导出全部</span>
+                  </button>
+                </div>
+                <div className="more-menu-section">
+                  <button className="more-menu-item">
+                    <span className="more-menu-icon">🔧</span>
+                    <span className="more-menu-text">设置</span>
+                  </button>
+                  <button className="more-menu-item">
+                    <span className="more-menu-icon">💡</span>
+                    <span className="more-menu-text">帮助中心</span>
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </aside>
+
+      {activeLeftMenu === "start" ? (
+        <main className="start-panel">
+          <LazyLoader>
+            <StartPage
+              notebooks={notebooks}
+              recentViews={recentViews}
+              onViewDoc={handleViewDoc}
+              onCreateDoc={createDoc}
+              onCreateNotebook={createNotebook}
+            />
+          </LazyLoader>
+        </main>
+      ) : activeLeftMenu === "note" ? (
+        <main className="editor-panel">
+          <div className="empty-editor">
+            <div className="empty-icon">📝</div>
+            <div className="empty-text">小记功能开发中</div>
+          </div>
+        </main>
+      ) : activeLeftMenu === "favorite" ? (
+        <>
+          <aside className="docs-sidebar">
+            <div className="docs-header">
+              <div className="docs-title-row">
+                <span className="docs-icon">⭐</span>
+                <span className="docs-title">收藏</span>
+              </div>
+            </div>
+            <div className="docs-list">
+              {favoriteDocs.length === 0 ? (
+                <div className="empty-favorite">
+                  <span className="empty-icon">⭐</span>
+                  <span className="empty-text">暂无收藏</span>
+                  <span className="empty-hint">点击文档上的星标进行收藏</span>
+                </div>
+              ) : (
+                <>
+                  <div className="favorite-list-header">
+                    <span className="favorite-col-name">名称</span>
+                    <span className="favorite-col-belong">归属</span>
+                    <span className="favorite-col-time">更新时间</span>
+                  </div>
+                  {favoriteDocs.map(({ notebook, doc }) => (
+                    <div
+                      key={doc.id}
+                      className={`favorite-item ${activeDocId === doc.id ? "active" : ""}`}
+                      onClick={() => handleViewDoc(notebook.id, doc.id)}
+                    >
+                      <span className="favorite-item-name">{doc.title}</span>
+                      <span className="favorite-item-belong">{notebook.title}</span>
+                      <span className="favorite-item-time">
+                        {new Date(doc.updatedAt).toLocaleString('zh-CN')}
+                      </span>
+                      <button
+                        className="favorite-item-remove"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          toggleFavorite(notebook.id, doc.id);
+                        }}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                </>
+              )}
+            </div>
+          </aside>
+          <main className="editor-panel">
+            {activeDoc && (
+              <>
+                <header className="editor-header">
+                  <div className="editor-title-row">
+                    <input
+                      className="editor-title-input"
+                      value={activeDoc.title}
+                      onChange={(e) => updateDocContent({ title: e.target.value })}
+                      placeholder="无标题"
+                    />
+                    <span className={`save-status-indicator ${saveStatus}`}>
+                      {saveStatus === 'saving' && <span className="save-spinner" />}
+                      {saveStatus === 'saving' && '正在保存...'}
+                      {saveStatus === 'saved' && '✓已保存'}
+                      {saveStatus === 'error' && '✗保存失败'}
+                      {saveStatus === 'idle' && '已保存'}
+                    </span>
+                    <LazyLoader>
+                      <DocTagSelector
+                        notebookId={activeNotebookId}
+                        docId={activeDocId}
+                        currentTags={activeDoc.tags || []}
+                        docContent={activeDoc.content || ''}
+                        onTagsChange={() => setTagsUpdated(prev => prev + 1)}
+                      />
+                    </LazyLoader>
+                    <div className="title-toolbar">
+                      <button 
+                        className={`title-toolbar-btn ${activeDoc.favorite ? "favorited" : ""}`} 
+                        title="收藏"
+                        onClick={() => toggleFavorite(activeNotebookId, activeDocId)}
+                      >
+                        ⭐
+                      </button>
+                      <button 
+                        className="title-toolbar-btn presentation-btn" 
+                        title="演示"
+                        onClick={() => setShowPresentationMenu(!showPresentationMenu)}
+                      >
+                        🎤
+                      </button>
+                      <button className="title-toolbar-btn" title="分享协作" onClick={() => activeDoc && handleCopyLink(activeDoc.id)}>
+                        🔗
+                      </button>
+                      <button className="title-toolbar-btn" title="在新窗口打开" onClick={() => activeDoc && handleOpenInNewWindow(activeDoc.id)}>
+                        ↗
+                      </button>
+                      <button className="title-toolbar-btn" title="更多操作">
+                        ⋯
+                      </button>
+                      <button className="title-toolbar-btn share-btn" title="分享" onClick={() => setShowSharePanel(true)}>
+                        分享
+                      </button>
+                      <button className="title-toolbar-btn" title="视图切换">
+                        □□
+                      </button>
+                      <button className="title-toolbar-btn" title="全屏">
+                        ⛶
+                      </button>
+                    </div>
+                    {showPresentationMenu && (
+                      <div className="presentation-menu">
+                        <button className="presentation-menu-item" onClick={handleStartPresentation}>
+                          <span className="presentation-menu-icon">🎤</span>
+                          <span className="presentation-menu-text">开始演示</span>
+                        </button>
+                        <button className="presentation-menu-item" onClick={handleEditPresentation}>
+                          <span className="presentation-menu-icon">📝</span>
+                          <span className="presentation-menu-text">编辑演示分页</span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                  <div className="editor-toolbar">
+                    <div className="toolbar-left">
+                      <button className="toolbar-btn" onClick={undo} disabled={!canUndo} title="撤销">
+                        ↩
+                      </button>
+                      <button className="toolbar-btn" onClick={redo} disabled={!canRedo} title="重做">
+                        ↪
+                      </button>
+                      <span className="toolbar-divider" />
+                      <select className="toolbar-select" value={textStyle} onChange={(e) => setTextStyle(e.target.value)} title="样式">
+                        <option value="正文">正文</option>
+                        <option value="标题1">标题1</option>
+                        <option value="标题2">标题2</option>
+                        <option value="标题3">标题3</option>
+                        <option value="引用">引用</option>
+                        <option value="代码">代码</option>
+                      </select>
+                      <select className="toolbar-select" value={fontSize} onChange={(e) => setFontSize(e.target.value)} title="字号">
+                        <option value="12px">12px</option>
+                        <option value="13px">13px</option>
+                        <option value="14px">14px</option>
+                        <option value="15px">15px</option>
+                        <option value="16px">16px</option>
+                        <option value="18px">18px</option>
+                        <option value="20px">20px</option>
+                      </select>
+                      <span className="toolbar-divider" />
+                      <button className="toolbar-btn" onClick={() => insertWrap("**")} title="加粗">
+                        <strong>B</strong>
+                      </button>
+                      <button className="toolbar-btn" onClick={() => insertWrap("*")} title="斜体">
+                        <em>I</em>
+                      </button>
+                      <button className="toolbar-btn" onClick={insertUnderline} title="下划线">
+                        <u>U</u>
+                      </button>
+                      <button className="toolbar-btn" onClick={() => insertWrap("~~")} title="删除线">
+                        <s>S</s>
+                      </button>
+                      <span className="toolbar-divider" />
+                      <button 
+                        className={`toolbar-btn more-options-btn ${showMoreOptions ? "active" : ""}`} 
+                        title="更多选项"
+                        onClick={() => setShowMoreOptions(!showMoreOptions)}
+                      >
+                        ⋯
+                      </button>
+                    </div>
+                  </div>
+                  {showMoreOptions && (
+                    <div className="editor-toolbar expanded-toolbar">
+                      <div className="toolbar-left">
+                        <span className="toolbar-section-label">标题</span>
+                        <button className="toolbar-btn" onClick={() => insertHeadingFunc(1)} title="标题1">
+                          H1
+                        </button>
+                        <button className="toolbar-btn" onClick={() => insertHeadingFunc(2)} title="标题2">
+                          H2
+                        </button>
+                        <button className="toolbar-btn" onClick={() => insertHeadingFunc(3)} title="标题3">
+                          H3
+                        </button>
+                        <span className="toolbar-divider" />
+                        <span className="toolbar-section-label">列表</span>
+                        <button className="toolbar-btn" onClick={insertUnorderedList} title="无序列表">
+                          •
+                        </button>
+                        <button className="toolbar-btn" onClick={insertOrderedList} title="有序列表">
+                          1.
+                        </button>
+                        <span className="toolbar-divider" />
+                        <span className="toolbar-section-label">插入</span>
+                        <button className="toolbar-btn" onClick={insertQuote} title="引用">
+                          "
+                        </button>
+                        <button className="toolbar-btn" onClick={insertCodeBlockFunc} title="代码块">
+                          &lt;/&gt;
+                        </button>
+                        <button className="toolbar-btn" onClick={insertLinkFunc} title="链接">
+                          🔗
+                        </button>
+                        <label className="toolbar-btn file-label" title="插入图片">
+                          🖼
+                          <input
+                            type="file"
+                            accept="image/*"
+                            className="file-input"
+                            onChange={(event) => {
+                              const file = event.target.files?.[0];
+                              if (!file) return;
+                              void insertImageFunc(file);
+                              event.target.value = "";
+                            }}
+                          />
+                        </label>
+                      </div>
+                    </div>
+                  )}
+                </header>
+                
+                <div className="editor-content">
+                  {activeDoc ? (
+                    <div className="editor-body">
+                      <textarea
+                        ref={textareaRef}
+                        className="editor-textarea"
+                        value={activeDoc?.content || ""}
+                        onChange={(e) => {
+                          if (activeDoc) {
+                            updateDocContent({ content: e.target.value });
+                          }
+                        }}
+                        onPaste={handlePaste}
+                        placeholder="开始编写你的文章..."
+                        spellCheck={false}
+                        style={{ fontSize: fontSize }}
+                      />
+                    </div>
+                  ) : (
+                    <div className="empty-editor">
+                      <div className="empty-icon">📄</div>
+                      <div className="empty-text">选择文档开始编辑</div>
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+          </main>
+        </>
+      ) : (
+        <>
+          <aside className="docs-sidebar">
+            <div className="docs-header">
+              <div className="docs-title-row">
+                <span className="docs-icon">📁</span>
+                <span className="docs-title">{activeNotebook?.title || "知识库"}</span>
+                <button
+                  className="btn-add-doc"
+                  onClick={() => activeNotebook && createDoc(activeNotebook.id, null)}
+                  title="新建文档"
+                >
+                  +
+                </button>
+              </div>
+            </div>
+            
+            <div className="docs-search">
+              <input
+                className="search-input"
+                placeholder="搜索文档"
+                value={searchText}
+                onChange={(event) => setSearchText(event.target.value)}
+              />
+            </div>
+            
+            <div className="docs-nav">
+              <button
+                className={`docs-nav-item ${activeView === "notebooks" ? "active" : ""}`}
+                onClick={() => setActiveView("notebooks")}
+              >
+                <span className="docs-nav-icon">📄</span>
+                <span className="docs-nav-text">全部文档</span>
+                <span className="docs-nav-count">{activeNotebook?.docs.length || 0}</span>
+              </button>
+              <button
+                className={`docs-nav-item ${activeView === "favorite" ? "active" : ""}`}
+                onClick={() => setActiveView("favorite")}
+              >
+                <span className="docs-nav-icon">⭐</span>
+                <span className="docs-nav-text">收藏</span>
+                <span className="docs-nav-count">{favoriteDocs.length}</span>
+              </button>
+            </div>
+            
+            <div className="docs-list">
+              {activeView === "favorite" ? (
+                favoriteDocs.length === 0 ? (
+                  <div className="empty-favorite">
+                    <span className="empty-icon">⭐</span>
+                    <span className="empty-text">暂无收藏</span>
+                  </div>
+                ) : (
+                  favoriteDocs.map(({ notebook, doc }) => (
+                    <button
+                      key={doc.id}
+                      className={`doc-item ${activeDocId === doc.id ? "active" : ""}`}
+                      onClick={() => handleViewDoc(notebook.id, doc.id)}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        setContextMenu({ x: e.clientX, y: e.clientY, docId: doc.id });
+                      }}
+                    >
+                      <span className="doc-icon">📄</span>
+                      <span className="doc-name">{doc.title}</span>
+                      <span className="doc-favorite">⭐</span>
+                    </button>
+                  ))
+                )
+              ) : (
+                searchResultDocs.map((doc) => (
+                  <button
+                    key={doc.id}
+                    className={`doc-item ${activeDocId === doc.id ? "active" : ""}`}
+                    onClick={() => handleViewDoc(activeNotebookId, doc.id)}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      setContextMenu({ x: e.clientX, y: e.clientY, docId: doc.id });
+                    }}
+                    style={{ paddingLeft: `${(docDepthMap.get(doc.id) ?? 0) * 16 + 16}px` }}
+                  >
+                    <span className="doc-icon">{doc.pinned ? "📌" : "📄"}</span>
+                    <span className="doc-name">{doc.title}</span>
+                    {doc.favorite && <span className="doc-favorite">⭐</span>}
+                  </button>
+                ))
+              )}
+            </div>
+          </aside>
+          
+          <main className="editor-panel">
+            {activeView === "trash" ? (
+              <div className="trash-view">
+                <div className="docs-header">
+                  <button className="btn-back" onClick={() => setActiveView("notebooks")}>
+                    ←返回
+                  </button>
+                  <span className="docs-title">回收站</span>
+                  <button className="btn-clear-trash" onClick={() => clearTrash()} disabled={trash.length === 0}>
+                    清空回收站
+                  </button>
+                </div>
+                <div className="docs-list">
+                  {trash.length === 0 ? (
+                    <div className="empty-trash">
+                      <span className="empty-icon">🗑️</span>
+                      <span className="empty-text">回收站为空</span>
+                    </div>
+                  ) : (
+                    trash.map((doc) => (
+                      <div key={doc.id} className="trash-item">
+                        <button
+                          className="trash-item-content"
+                          onClick={() => {
+                            handleViewDoc(doc.notebookId, doc.id);
+                          }}
+                        >
+                          <span className="trash-item-icon">📄</span>
+                          <span className="trash-item-title">{doc.title}</span>
+                        </button>
+                        <div className="trash-item-meta">
+                          <span className="trash-item-notebook">{doc.notebookTitle}</span>
+                        </div>
+                        <div className="trash-item-actions">
+                          <button className="trash-action-btn restore" onClick={() => restoreFromTrash(doc.id)}>
+                            ↩
+                          </button>
+                          <button className="trash-action-btn delete" onClick={() => deleteFromTrash(doc.id)}>
+                            🗑️
+                          </button>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            ) : (
+              <>
+                <header className="editor-header">
+                  <div className="editor-title-row">
+                    <input
+                      className="editor-title-input"
+                      value={activeDoc?.title || ""}
+                      onChange={(e) => activeDoc && updateDocContent({ title: e.target.value })}
+                      placeholder="无标题"
+                    />
+                    <span className={`save-status-indicator ${saveStatus}`}>
+                      {saveStatus === 'saving' && <span className="save-spinner" />}
+                      {saveStatus === 'saving' && '正在保存...'}
+                      {saveStatus === 'saved' && '✓已保存'}
+                      {saveStatus === 'error' && '✗保存失败'}
+                      {saveStatus === 'idle' && '已保存'}
+                    </span>
+                    <div className="title-toolbar">
+                      <button 
+                        className={`title-toolbar-btn ${activeDoc?.favorite ? "favorited" : ""}`} 
+                        title="收藏"
+                        onClick={() => activeDoc && toggleFavorite(activeNotebookId, activeDocId)}
+                      >
+                        ⭐
+                      </button>
+                      <button 
+                        className="title-toolbar-btn presentation-btn" 
+                        title="演示"
+                        onClick={() => setShowPresentationMenu(!showPresentationMenu)}
+                      >
+                        🎤
+                      </button>
+                      <button className="title-toolbar-btn" title="分享协作" onClick={() => activeDoc && handleCopyLink(activeDoc.id)}>
+                        🔗
+                      </button>
+                      <button className="title-toolbar-btn" title="在新窗口打开" onClick={() => activeDoc && handleOpenInNewWindow(activeDoc.id)}>
+                        ↗
+                      </button>
+                      <button className="title-toolbar-btn" title="更多操作">
+                        ⋯
+                      </button>
+                      <button className="title-toolbar-btn share-btn" title="分享" onClick={() => setShowSharePanel(true)}>
+                        分享
+                      </button>
+                      <button className="title-toolbar-btn" title="视图切换">
+                        □□
+                      </button>
+                      <button className="title-toolbar-btn" title="全屏">
+                        ⛶
+                      </button>
+                    </div>
+                    {showPresentationMenu && (
+                      <div className="presentation-menu">
+                        <button className="presentation-menu-item" onClick={handleStartPresentation}>
+                          <span className="presentation-menu-icon">🎤</span>
+                          <span className="presentation-menu-text">开始演示</span>
+                        </button>
+                        <button className="presentation-menu-item" onClick={handleEditPresentation}>
+                          <span className="presentation-menu-icon">📝</span>
+                          <span className="presentation-menu-text">编辑演示分页</span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                  <div className="editor-toolbar">
+                    <div className="toolbar-left">
+                      <button className="toolbar-btn" onClick={undo} disabled={!canUndo} title="撤销">
+                        ↩
+                      </button>
+                      <button className="toolbar-btn" onClick={redo} disabled={!canRedo} title="重做">
+                        ↪
+                      </button>
+                      <span className="toolbar-divider" />
+                      <select className="toolbar-select" value={textStyle} onChange={(e) => setTextStyle(e.target.value)} title="样式">
+                        <option value="正文">正文</option>
+                        <option value="标题1">标题1</option>
+                        <option value="标题2">标题2</option>
+                        <option value="标题3">标题3</option>
+                        <option value="引用">引用</option>
+                        <option value="代码">代码</option>
+                      </select>
+                      <select className="toolbar-select" value={fontSize} onChange={(e) => setFontSize(e.target.value)} title="字号">
+                        <option value="12px">12px</option>
+                        <option value="13px">13px</option>
+                        <option value="14px">14px</option>
+                        <option value="15px">15px</option>
+                        <option value="16px">16px</option>
+                        <option value="18px">18px</option>
+                        <option value="20px">20px</option>
+                      </select>
+                      <span className="toolbar-divider" />
+                      <button className="toolbar-btn" onClick={() => insertWrap("**")} title="加粗">
+                        <strong>B</strong>
+                      </button>
+                      <button className="toolbar-btn" onClick={() => insertWrap("*")} title="斜体">
+                        <em>I</em>
+                      </button>
+                      <button className="toolbar-btn" onClick={insertUnderline} title="下划线">
+                        <u>U</u>
+                      </button>
+                      <button className="toolbar-btn" onClick={() => insertWrap("~~")} title="删除线">
+                        <s>S</s>
+                      </button>
+                      <span className="toolbar-divider" />
+                      <button 
+                        className={`toolbar-btn more-options-btn ${showMoreOptions ? "active" : ""}`} 
+                        title="更多选项"
+                        onClick={() => setShowMoreOptions(!showMoreOptions)}
+                      >
+                        ⋯
+                      </button>
+                    </div>
+                  </div>
+                  {showMoreOptions && (
+                    <div className="editor-toolbar expanded-toolbar">
+                      <div className="toolbar-left">
+                        <span className="toolbar-section-label">标题</span>
+                        <button className="toolbar-btn" onClick={() => insertHeadingFunc(1)} title="标题1">
+                          H1
+                        </button>
+                        <button className="toolbar-btn" onClick={() => insertHeadingFunc(2)} title="标题2">
+                          H2
+                        </button>
+                        <button className="toolbar-btn" onClick={() => insertHeadingFunc(3)} title="标题3">
+                          H3
+                        </button>
+                        <span className="toolbar-divider" />
+                        <span className="toolbar-section-label">列表</span>
+                        <button className="toolbar-btn" onClick={insertUnorderedList} title="无序列表">
+                          •
+                        </button>
+                        <button className="toolbar-btn" onClick={insertOrderedList} title="有序列表">
+                          1.
+                        </button>
+                        <span className="toolbar-divider" />
+                        <span className="toolbar-section-label">插入</span>
+                        <button className="toolbar-btn" onClick={insertQuote} title="引用">
+                          "
+                        </button>
+                        <button className="toolbar-btn" onClick={insertCodeBlockFunc} title="代码块">
+                          &lt;/&gt;
+                        </button>
+                        <button className="toolbar-btn" onClick={insertLinkFunc} title="链接">
+                          🔗
+                        </button>
+                        <label className="toolbar-btn file-label" title="插入图片">
+                          🖼
+                          <input
+                            type="file"
+                            accept="image/*"
+                            className="file-input"
+                            onChange={(event) => {
+                              const file = event.target.files?.[0];
+                              if (!file) return;
+                              void insertImageFunc(file);
+                              event.target.value = "";
+                            }}
+                          />
+                        </label>
+                      </div>
+                    </div>
+                  )}
+                </header>
+                
+                <div className="editor-content">
+                  {activeDoc ? (
+                    <div className="editor-body">
+                      {activeView === "trash" ? (
+                        <div className="trash-document-view">
+                          <div className="trash-doc-title">{activeDoc.title}</div>
+                          <div className="trash-doc-content">{activeDoc.content || "该文档没有内容"}</div>
+                        </div>
+                      ) : (
+                        <textarea
+                          ref={textareaRef}
+                          className="editor-textarea"
+                          value={activeDoc?.content || ""}
+                          onChange={(e) => {
+                            if (activeDoc) {
+                              updateDocContent({ content: e.target.value });
+                            }
+                          }}
+                          onPaste={handlePaste}
+                          placeholder="开始编写你的文章..."
+                          spellCheck={false}
+                          style={{ fontSize: fontSize }}
+                        />
+                      )}
+                    </div>
+                  ) : (
+                    <div className="empty-editor">
+                      <div className="empty-icon">📄</div>
+                      <div className="empty-text">选择文档开始编辑</div>
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+          </main>
+        </>
+      )}
+
+      {contextMenu && (
+        <div 
+          className="context-menu"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+        >
+          <button className="context-menu-item" onClick={() => handleRename(contextMenu.docId)}>
+            <span className="context-menu-icon">✏️</span>
+            <span className="context-menu-text">重命名</span>
+          </button>
+          <button className="context-menu-item" onClick={() => handleCopyLink(contextMenu.docId)}>
+            <span className="context-menu-icon">🔗</span>
+            <span className="context-menu-text">复制链接</span>
+          </button>
+          <button className="context-menu-item" onClick={() => handleOpenInNewWindow(contextMenu.docId)}>
+            <span className="context-menu-icon">↗</span>
+            <span className="context-menu-text">在新窗口打开</span>
+          </button>
+          <button className="context-menu-item" onClick={() => handleRemoveFromDirectory(contextMenu.docId)}>
+            <span className="context-menu-icon">📤</span>
+            <span className="context-menu-text">移出目录</span>
+          </button>
+          <div className="context-menu-divider" />
+          <button className="context-menu-item" onClick={() => handleCopy(contextMenu.docId)}>
+            <span className="context-menu-icon">📋</span>
+            <span className="context-menu-text">复制...</span>
+          </button>
+          <button className="context-menu-item" onClick={() => handleMove(contextMenu.docId)}>
+            <span className="context-menu-icon">📦</span>
+            <span className="context-menu-text">移动...</span>
+          </button>
+          <button className="context-menu-item" onClick={() => handleExport(contextMenu.docId)}>
+            <span className="context-menu-icon">📥</span>
+            <span className="context-menu-text">导出...</span>
+          </button>
+          <button className="context-menu-item" onClick={() => handlePin(contextMenu.docId)}>
+            <span className="context-menu-icon">📌</span>
+            <span className="context-menu-text">置顶文档</span>
+          </button>
+          <div className="context-menu-divider" />
+          <button className="context-menu-item danger" onClick={() => handleDelete(contextMenu.docId)}>
+            <span className="context-menu-icon">🗑️</span>
+            <span className="context-menu-text">删除</span>
+          </button>
+        </div>
+      )}
+
+      {notebookContextMenu && (
+        <div 
+          className="context-menu"
+          style={{ left: notebookContextMenu.x, top: notebookContextMenu.y }}
+        >
+          <button className="context-menu-item" onClick={() => handleRemoveNotebookFromFavorites(notebookContextMenu.notebookId)}>
+            <span className="context-menu-icon">↗</span>
+            <span className="context-menu-text">移出常用</span>
+          </button>
+          <button className="context-menu-item" onClick={() => handleSetNotebookOfflineAvailable(notebookContextMenu.notebookId)}>
+            <span className="context-menu-icon">📥</span>
+            <span className="context-menu-text">设为离线可用</span>
+          </button>
+          <button className="context-menu-item" onClick={() => handleNotebookPermissions(notebookContextMenu.notebookId)}>
+            <span className="context-menu-icon">🔒</span>
+            <span className="context-menu-text">权限</span>
+          </button>
+          <button className="context-menu-item" onClick={() => handleNotebookMoreSettings(notebookContextMenu.notebookId)}>
+            <span className="context-menu-icon">⚙️</span>
+            <span className="context-menu-text">更多设置</span>
+          </button>
+          <div className="context-menu-divider" />
+          <button className="context-menu-item danger" onClick={() => handleDeleteNotebook(notebookContextMenu.notebookId)}>
+            <span className="context-menu-icon">🗑️</span>
+            <span className="context-menu-text">删除</span>
+          </button>
+        </div>
+      )}
+
+      <LazyLoader>
+        <SharePanel
+          isOpen={showSharePanel}
+          onClose={() => setShowSharePanel(false)}
+          docTitle={activeDoc?.title || "未命名文档"}
+          docId={activeDocId}
+          notebookId={activeNotebookId}
+          shareLinks={activeDoc?.shareLinks || []}
+          onGenerateLink={handleGenerateShareLink}
+          onDeleteLink={handleDeleteShareLink}
+          onCopyLink={handleCopyShareUrl}
+        />
+      </LazyLoader>
+
+      <LazyLoader>
+        <TagPanel
+          isOpen={showTagPanel}
+          onClose={() => setShowTagPanel(false)}
+        />
+      </LazyLoader>
+
+      <LazyLoader>
+        <SearchPanel
+          isOpen={showSearchPanel}
+          onClose={() => setShowSearchPanel(false)}
+        />
+      </LazyLoader>
+
+      {showVersionHistory && (
+        <LazyLoader>
+          <VersionHistoryPanel
+            notebookId={activeNotebookId}
+            docId={activeDocId}
+            onClose={() => setShowVersionHistory(false)}
+          />
+        </LazyLoader>
+      )}
+
+      {showRecoveryDialog && recoveryDraftMeta && (
+        <div className="recovery-overlay" onClick={() => setShowRecoveryDialog(false)}>
+          <div className="recovery-dialog" onClick={(e) => e.stopPropagation()}>
+            <div className="recovery-header">
+              <span className="recovery-icon">⚠️</span>
+              <span className="recovery-title">发现本地草稿</span>
+            </div>
+            <div className="recovery-body">
+              <p>检测到有未保存的编辑内容，可能是上次异常退出导致的。</p>
+              <div className="recovery-draft-info">
+                <div className="recovery-draft-row">
+                  <span className="recovery-label">草稿时间</span>
+                  <span className="recovery-value">{new Date(recoveryDraftMeta.timestamp).toLocaleString('zh-CN')}</span>
+                </div>
+                {recoveryDraftMeta.docTitle && (
+                  <div className="recovery-draft-row">
+                    <span className="recovery-label">编辑文档</span>
+                    <span className="recovery-value">{recoveryDraftMeta.docTitle}</span>
+                  </div>
+                )}
+              </div>
+              <p className="recovery-hint">恢复草稿将覆盖当前数据，放弃则永久删除本地草稿。</p>
+            </div>
+            <div className="recovery-actions">
+              <button className="recovery-btn discard" onClick={handleDiscardDraft}>
+                放弃草稿
+              </button>
+              <button className="recovery-btn recover" onClick={handleRecoverDraft}>
+                恢复草稿
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      </div>
+      )}
+      <ToastContainer toasts={toasts} onClose={removeToast} />
+    </>
+  );
+}
+
+export default App;
